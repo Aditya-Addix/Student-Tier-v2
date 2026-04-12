@@ -34,11 +34,6 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WOLFRAM_APP_ID = os.getenv("WOLFRAM_APP_ID")
-FRONTEND_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://addix-labs-student-tier.vercel.app",
-]
 
 EXAM_TARGETS = {
     "IOQM": {
@@ -80,7 +75,13 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=FRONTEND_ORIGINS,
+    allow_origins=[
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "http://localhost:3000",
+        "http://localhost:5500",
+        "https://addixlabs.in",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
