@@ -6,10 +6,10 @@ from pydantic import BaseModel, Field
 
 
 class TraceStep(BaseModel):
-    step_number: int = Field(..., ge=1, le=5, description="1-based position in the reasoning workflow.")
+    step_number: int = Field(..., ge=1, description="1-based position in the reasoning workflow.")
     title: str = Field(..., min_length=1, description="Frontend-ready title for this reasoning step.")
     description: str = Field(..., min_length=1, description="Human-readable summary of what happened in this step.")
-    agent_type: Literal["Neural", "Symbolic"] = Field(
+    agent_type: Literal["Neural", "Symbolic", "Planner", "Caching", "Verification", "Vision"] = Field(
         ...,
         description="Type of reasoning engine responsible for this step.",
     )
@@ -27,15 +27,56 @@ class AgentResponse(BaseModel):
     )
     explanation_trace: List[TraceStep] = Field(
         ...,
-        min_length=5,
-        max_length=5,
-        description="Exactly five reasoning steps used by the frontend trace UI.",
+        min_length=1,
+        description="Primary trace steps used by the frontend terminal UI.",
+    )
+    logic_trace: List[TraceStep] = Field(
+        ...,
+        min_length=1,
+        description="Ordered planner steps that can be replayed one-by-one in the frontend.",
+    )
+    planner_state: Dict[str, str | bool | int | float | None] = Field(
+        ...,
+        description="State metadata for cache status, verification branch, and persisted session linkage.",
     )
 
 
 class QueryInput(BaseModel):
     student_query: str = Field(..., min_length=1, description="Student's full natural-language question.")
     target_exam: str = Field(..., min_length=1, description="Exam context to tune the explanation style.")
+    session_id: Optional[str] = Field(
+        default="default",
+        min_length=1,
+        description="Conversation session identifier for contextual follow-up reasoning.",
+    )
+
+
+class OCRInput(BaseModel):
+    image_base64: str = Field(..., min_length=20, description="Base64-encoded image payload.")
+    target_exam: str = Field(default="NSEJS", min_length=1, description="Exam context for planner routing.")
+    session_id: Optional[str] = Field(
+        default="default",
+        min_length=1,
+        description="Conversation session identifier for contextual follow-up reasoning.",
+    )
+
+
+class ConversationContext(BaseModel):
+    session_id: str = Field(..., min_length=1, description="Session key associated with this context state.")
+    last_query: str = Field(..., min_length=1, description="Most recent resolved query text used for reasoning.")
+    last_answer: str = Field(..., min_length=1, description="Most recent final answer emitted to the user.")
+    variables: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Extracted symbolic variables retained for follow-up prompts.",
+    )
+
+
+class OCRResponse(BaseModel):
+    extracted_text: str = Field(..., min_length=1, description="Raw OCR text extracted from the image.")
+    cleaned_query: str = Field(..., min_length=1, description="Math-normalized query string for planner execution.")
+    confidence: float = Field(..., ge=0, le=100, description="Average OCR confidence score.")
+    warning: Optional[str] = Field(default=None, description="Low-confidence warning from Vision Agent.")
+    solve_result: AgentResponse = Field(..., description="Planner response auto-generated from OCR query.")
 
 
 class ExamCountdown(BaseModel):
