@@ -12,8 +12,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Dict, Literal, TypedDict
 
+import httpx
 import pytesseract
-import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +28,7 @@ from models import (
     ConversationContext,
     DashboardStatsResponse,
     ExamCountdown,
+    FinalAnswerResponse,
     LongTermGoal,
     OCRInput,
     OCRResponse,
@@ -51,6 +52,13 @@ INVALID_WOLFRAM_MARKERS = (
 )
 CACHE_LOOKBACK_HOURS = 8
 CACHE_SIMILARITY_THRESHOLD = 0.90
+WOLFRAM_RESULT_ENDPOINT = "https://api.wolframalpha.com/v1/result"
+
+WOLFRAM_HTTP_CLIENT = httpx.AsyncClient(
+    http2=True,
+    timeout=httpx.Timeout(30.0, connect=10.0),
+    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+)
 
 
 class APITimeoutError(Exception):
@@ -159,17 +167,16 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-        "http://localhost:3000",
-        "http://localhost:5500",
-        "https://addixlabs.in",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("shutdown")
+async def shutdown_wolfram_client() -> None:
+    await WOLFRAM_HTTP_CLIENT.aclose()
 
 
 @app.exception_handler(APITimeoutError)
@@ -379,12 +386,13 @@ async def _check_wolfram_connection() -> str:
     if not app_id:
         return "missing_app_id"
 
-    endpoint = "http://api.wolframalpha.com/v1/result"
-    query_params = urllib.parse.urlencode({"appid": app_id, "i": "1+1"})
-    request_url = f"{endpoint}?{query_params}"
     try:
-        response = await asyncio.to_thread(requests.get, request_url, timeout=8)
-    except requests.RequestException:
+        response = await WOLFRAM_HTTP_CLIENT.get(
+            WOLFRAM_RESULT_ENDPOINT,
+            params={"appid": app_id, "i": "1+1"},
+            timeout=httpx.Timeout(8.0, connect=4.0),
+        )
+    except httpx.HTTPError:
         return "offline"
 
     if response.status_code == 200:
@@ -517,70 +525,124 @@ async def query_wolfram(query_text: str) -> WolframResult:
             "steps": "Step 1: Missing WOLFRAM_APP_ID.\nStep 2: Security Protocol: Resetting API Handshake.",
         }
 
-    endpoint = "http://api.wolframalpha.com/v1/result"
-    query_params = urllib.parse.urlencode({"appid": app_id, "i": normalized_query})
-    request_url = f"{endpoint}?{query_params}"
+    encoded_query = urllib.parse.quote_plus(normalized_query)
+    max_retries = 3
+    last_exception: Exception | None = None
 
-    try:
-        response = await asyncio.to_thread(requests.get, request_url, timeout=20)
-    except requests.Timeout as exc:
-        logger.warning("Wolfram timeout for '%s'", normalized_query)
-        raise APITimeoutError("Wolfram timeout") from exc
-    except requests.RequestException as exc:
-        logger.warning("Wolfram request failed for '%s': %s", normalized_query, exc)
-        return {
-            "answer": SECURITY_PROTOCOL_MESSAGE,
-            "state": "security",
-            "formula": formula,
-            "steps": "Step 1: Request dispatch failed before deterministic execution.\n"
-            "Step 2: Security Protocol: Resetting API Handshake.",
-        }
+    for attempt in range(max_retries):
+        try:
+            response = await WOLFRAM_HTTP_CLIENT.get(
+                WOLFRAM_RESULT_ENDPOINT,
+                params={"appid": app_id, "i": encoded_query},
+            )
 
-    if response.status_code == 200:
-        answer_text = response.text.strip()
-        if _is_valid_wolfram_answer(answer_text):
+            if 500 <= response.status_code < 600:
+                if attempt < max_retries - 1:
+                    sleep_duration = 2 * (2 ** attempt)
+                    logger.warning(
+                        "Wolfram returned HTTP %s, retrying in %ds... (attempt %d/%d)",
+                        response.status_code,
+                        sleep_duration,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    await asyncio.sleep(sleep_duration)
+                    continue
+                last_exception = APITimeoutError(f"Wolfram HTTP {response.status_code} after {max_retries} attempts")
+                break
+
+            if response.status_code == 200:
+                answer_text = response.text.strip()
+                if _is_valid_wolfram_answer(answer_text):
+                    return {
+                        "answer": answer_text,
+                        "state": "ok",
+                        "formula": formula,
+                        "steps": _build_step_trace(normalized_query, answer_text),
+                    }
+                return {
+                    "answer": WOLFRAM_FALLBACK_RESULT,
+                    "state": "fallback",
+                    "formula": formula,
+                    "steps": _build_step_trace(normalized_query, "No deterministic short-answer output was available."),
+                }
+
+            if response.status_code in {408, 504}:
+                if attempt < max_retries - 1:
+                    sleep_duration = 2 * (2 ** attempt)
+                    logger.warning(
+                        "Wolfram timeout HTTP %s, retrying in %ds... (attempt %d/%d)",
+                        response.status_code,
+                        sleep_duration,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    await asyncio.sleep(sleep_duration)
+                    continue
+                raise APITimeoutError(f"Wolfram timeout response HTTP {response.status_code} after {max_retries} attempts")
+
+            if response.status_code in {401, 403}:
+                logger.warning("Wolfram authentication failed with HTTP %s", response.status_code)
+                return {
+                    "answer": SECURITY_PROTOCOL_MESSAGE,
+                    "state": "security",
+                    "formula": formula,
+                    "steps": "Step 1: Authentication challenge received from Wolfram API.\n"
+                    "Step 2: Security Protocol: Resetting API Handshake.",
+                }
+
+            if response.status_code == 501:
+                logger.info("Wolfram could not compute deterministic result for query: %s", normalized_query)
+                return {
+                    "answer": WOLFRAM_FALLBACK_RESULT,
+                    "state": "fallback",
+                    "formula": formula,
+                    "steps": _build_step_trace(normalized_query, "Wolfram returned HTTP 501: no deterministic result."),
+                }
+
+            logger.warning("Wolfram returned HTTP %s for query '%s'", response.status_code, normalized_query)
             return {
-                "answer": answer_text,
-                "state": "ok",
+                "answer": SECURITY_PROTOCOL_MESSAGE,
+                "state": "security",
                 "formula": formula,
-                "steps": _build_step_trace(normalized_query, answer_text),
+                "steps": "Step 1: Non-success HTTP status received from Wolfram API.\n"
+                "Step 2: Security Protocol: Resetting API Handshake.",
             }
-        return {
-            "answer": WOLFRAM_FALLBACK_RESULT,
-            "state": "fallback",
-            "formula": formula,
-            "steps": _build_step_trace(normalized_query, "No deterministic short-answer output was available."),
-        }
 
-    if response.status_code in {408, 504}:
-        raise APITimeoutError(f"Wolfram timeout response HTTP {response.status_code}")
+        except httpx.TimeoutException as exc:
+            if attempt < max_retries - 1:
+                sleep_duration = 2 * (2 ** attempt)
+                logger.warning(
+                    "Wolfram timeout for '%s', retrying in %ds... (attempt %d/%d)",
+                    normalized_query,
+                    sleep_duration,
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(sleep_duration)
+            else:
+                logger.warning("Wolfram timeout for '%s' after %d attempts", normalized_query, max_retries)
+                last_exception = APITimeoutError(f"Wolfram timeout after {max_retries} attempts") from exc
+                break
 
-    if response.status_code in {401, 403}:
-        logger.warning("Wolfram authentication failed with HTTP %s", response.status_code)
-        return {
-            "answer": SECURITY_PROTOCOL_MESSAGE,
-            "state": "security",
-            "formula": formula,
-            "steps": "Step 1: Authentication challenge received from Wolfram API.\n"
-            "Step 2: Security Protocol: Resetting API Handshake.",
-        }
+        except httpx.HTTPError as exc:
+            logger.warning("Wolfram request failed for '%s': %s", normalized_query, exc)
+            return {
+                "answer": SECURITY_PROTOCOL_MESSAGE,
+                "state": "security",
+                "formula": formula,
+                "steps": "Step 1: Request dispatch failed before deterministic execution.\n"
+                "Step 2: Security Protocol: Resetting API Handshake.",
+            }
 
-    if response.status_code == 501:
-        logger.info("Wolfram could not compute deterministic result for query: %s", normalized_query)
-        return {
-            "answer": WOLFRAM_FALLBACK_RESULT,
-            "state": "fallback",
-            "formula": formula,
-            "steps": _build_step_trace(normalized_query, "Wolfram returned HTTP 501: no deterministic result."),
-        }
+    if last_exception:
+        raise last_exception
 
-    logger.warning("Wolfram returned HTTP %s for query '%s'", response.status_code, normalized_query)
     return {
-        "answer": SECURITY_PROTOCOL_MESSAGE,
-        "state": "security",
+        "answer": WOLFRAM_FALLBACK_RESULT,
+        "state": "fallback",
         "formula": formula,
-        "steps": "Step 1: Non-success HTTP status received from Wolfram API.\n"
-        "Step 2: Security Protocol: Resetting API Handshake.",
+        "steps": "Step 1: Query processing exhausted all retry attempts.\nStep 2: Falling back to safe default response.",
     }
 
 
@@ -750,6 +812,53 @@ class Planner:
             "Step 2: Returned deterministic safe fallback.",
         }
 
+    @staticmethod
+    def _schedule_query_persistence(prompt: str, answer: str, subject: str, ocr_source: bool) -> None:
+        task = asyncio.create_task(persist_query_session(prompt, answer, subject, ocr_source))
+
+        def _log_task_result(done_task: asyncio.Task[QuerySession]) -> None:
+            try:
+                done_task.result()
+            except Exception as exc:
+                logger.warning("Unable to persist QuerySession record.", exc_info=exc)
+
+        task.add_done_callback(_log_task_result)
+
+    async def solve_text_query_fast(
+        self,
+        *,
+        student_query: str,
+        target_exam: str,
+        session_id: str,
+        ocr_source: bool,
+    ) -> str:
+        query_text = student_query.strip()
+        if not query_text:
+            raise HTTPException(status_code=422, detail="student_query cannot be empty.")
+
+        context_key = (session_id or "default").strip() or "default"
+        previous_context = self.context_buffer.get(context_key)
+        resolved_query, _ = _apply_contextual_memory(query_text, previous_context)
+        subject = _detect_subject(resolved_query)
+        wolfram_result = await self._route_text_query(resolved_query, subject)
+
+        merged_variables = _extract_variables(query_text, previous_context.variables if previous_context else None)
+        self.context_buffer[context_key] = ConversationContext(
+            session_id=context_key,
+            last_query=resolved_query,
+            last_answer=wolfram_result["answer"],
+            variables=merged_variables,
+        )
+
+        self._schedule_query_persistence(
+            resolved_query,
+            wolfram_result["answer"],
+            subject,
+            ocr_source,
+        )
+        _ = target_exam
+        return wolfram_result["answer"]
+
     async def solve_text_query(
         self,
         *,
@@ -790,17 +899,12 @@ class Planner:
         if verification_triggered:
             verification_summary = await run_python_repl_placeholder(resolved_query, wolfram_result["answer"])
 
-        record_id: int | None = None
-        try:
-            persisted = await persist_query_session(
-                resolved_query,
-                wolfram_result["answer"],
-                subject,
-                ocr_source,
-            )
-            record_id = persisted.id
-        except Exception as exc:
-            logger.warning("Unable to persist QuerySession record.", exc_info=exc)
+        self._schedule_query_persistence(
+            resolved_query,
+            wolfram_result["answer"],
+            subject,
+            ocr_source,
+        )
 
         merged_variables = _extract_variables(query_text, previous_context.variables if previous_context else None)
         self.context_buffer[context_key] = ConversationContext(
@@ -828,7 +932,7 @@ class Planner:
                 "source": "cache" if cache_hit else "wolfram",
                 "cache_hit": cache_hit,
                 "verification_triggered": verification_triggered,
-                "session_record_id": record_id,
+                "session_record_id": None,
                 "semantic_similarity": round(similarity_score, 2),
                 "subject": subject,
                 "ocr_source": ocr_source,
@@ -858,14 +962,38 @@ class Planner:
 planner = Planner()
 
 
-@app.post("/api/solve", response_model=AgentResponse)
-async def solve_student_query(payload: QueryInput) -> AgentResponse:
-    return await planner.solve_text_query(
-        student_query=payload.student_query,
-        target_exam=payload.target_exam,
-        session_id=payload.session_id or "default",
-        ocr_source=False,
-    )
+@app.post("/api/solve", response_model=FinalAnswerResponse)
+async def solve_student_query(payload: QueryInput) -> FinalAnswerResponse | JSONResponse:
+    try:
+        final_answer = await planner.solve_text_query_fast(
+            student_query=payload.student_query,
+            target_exam=payload.target_exam,
+            session_id=payload.session_id or "default",
+            ocr_source=False,
+        )
+        return FinalAnswerResponse(final_answer=final_answer)
+    except APITimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={"final_answer": SYSTEM_OVERRIDE_TIMEOUT_MESSAGE},
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={"final_answer": SYSTEM_OVERRIDE_TIMEOUT_MESSAGE},
+        )
+    except HTTPException as exc:
+        message = str(exc.detail) if exc.detail else WOLFRAM_FALLBACK_RESULT
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"final_answer": message},
+        )
+    except Exception as exc:
+        logger.error("Low-latency solve endpoint failed.", exc_info=exc)
+        return JSONResponse(
+            status_code=500,
+            content={"final_answer": WOLFRAM_FALLBACK_RESULT},
+        )
 
 
 @app.post("/api/ocr", response_model=OCRResponse)

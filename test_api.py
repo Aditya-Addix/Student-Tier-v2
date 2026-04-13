@@ -64,31 +64,20 @@ def test_solve_endpoint() -> None:
     except ValueError as exc:
         fail(f"/api/solve returned invalid JSON: {exc}", response_text=response.text)
 
-    explanation_trace = data.get("explanation_trace")
-    final_answer = str(data.get("final_answer", ""))
+    if set(data.keys()) != {"final_answer"}:
+        fail("/api/solve must return a flat payload with only final_answer.", response_text=response.text)
 
-    if not isinstance(explanation_trace, list):
-        fail("/api/solve did not return a valid explanation_trace array.", response_text=response.text)
-    if len(explanation_trace) != 5:
-        fail(f"/api/solve returned {len(explanation_trace)} trace steps instead of 5.", response_text=response.text)
-
-    symbolic_steps = [
-        step for step in explanation_trace if isinstance(step, dict) and step.get("agent_type") == "Symbolic"
-    ]
-    if not symbolic_steps:
-        print_trace(explanation_trace)
-        fail("/api/solve did not record a Symbolic trace step.", response_text=response.text)
+    final_answer = str(data.get("final_answer", "")).strip()
+    if not final_answer:
+        fail("/api/solve returned an empty final_answer.", response_text=response.text)
 
     lowered_answer = final_answer.lower()
     if "100" not in lowered_answer and "100 meters" not in lowered_answer:
-        print_trace(explanation_trace)
         fail("The final_answer did not contain the expected result '100' or '100 meters'.", response_text=final_answer)
 
     print("PASS: /api/solve returned HTTP 200")
-    print("PASS: explanation_trace contains exactly 5 steps")
-    print("PASS: explanation_trace includes a Symbolic step")
+    print("PASS: /api/solve returned only final_answer in the response payload")
     print("PASS: final_answer contains the expected distance of 100 meters")
-    print_trace(explanation_trace)
     print("\nReturned final_answer:")
     print(final_answer)
 

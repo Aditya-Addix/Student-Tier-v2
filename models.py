@@ -41,6 +41,14 @@ class AgentResponse(BaseModel):
     )
 
 
+class FinalAnswerResponse(BaseModel):
+    final_answer: str = Field(
+        ...,
+        min_length=1,
+        description="Deterministic final answer returned by the low-latency solve endpoint.",
+    )
+
+
 class QueryInput(BaseModel):
     student_query: str = Field(..., min_length=1, description="Student's full natural-language question.")
     target_exam: str = Field(..., min_length=1, description="Exam context to tune the explanation style.")
